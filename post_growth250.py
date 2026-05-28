@@ -4,27 +4,24 @@ WordPressに本物の記事として投稿 + Xにネイティブ投稿(リンク
 
 GitHub Actions の cron から平日の引け後に実行される想定。
 
-処理の流れ:
-  1. kabutan の日足四本値ページから本日の確定終値・前日比をスクレイピング
-  2. その数字 + 当日の材料(Claude のウェブ検索ツールで自動取得)から、
-     「ブログ記事(タイトル+本文)」と「ツイート本文(140字・リンクなし)」を
-     1回の生成でまとめて作成
-  3. WordPress REST API で記事を公開(=SEOに効く本物の投稿)
-  4. 同じ概況をXにネイティブ投稿(リンクは入れない)
+データ戦略:
+  - 値上がり/値下がりの主役銘柄・騰落数(breadth) … 自前の growth250-data.json
+    (moo-growth250-tracker が yfinance で生成しロリポップに配信。確定値)
+  - 指数の終値・前日比・当日の材料 … Claude のウェブ検索
+    (Anthropic 側で実行されるため、Actions IP のブロックを受けない。
+     引け後に走らせれば日経の大引け記事等から終値・前日比・騰落率を取得できる)
 
-ブログとXは独立して投稿し、片方が失敗してももう片方は実行します。
+処理の流れ:
+  1. growth250-data.json を取得し、主役銘柄と騰落数を抽出
+  2. それを材料として Claude に渡し、ウェブ検索で指数の数字と背景を調べさせて
+     「ブログ記事(タイトル+本文)」と「ツイート(140字・リンクなし)」を一括生成
+  3. WordPress REST API で記事を公開
+  4. 同じ概況を X にネイティブ投稿(リンクなし)
 
 環境変数(GitHub Secrets 経由):
-  ANTHROPIC_API_KEY  : Anthropic API キー
-  WP_BASE_URL        : WordPressのURL (例: https://moo-stock-blog.com)
-  WP_USER            : 投稿者ユーザー名
-  WP_APP_PASSWORD    : WordPressのアプリケーションパスワード
-  WP_CATEGORY_ID     : (任意) 投稿先カテゴリID
-  X_API_KEY          : X(Twitter) API Key (Consumer Key)
-  X_API_SECRET       : X API Key Secret (Consumer Secret)
-  X_ACCESS_TOKEN     : Access Token
-  X_ACCESS_SECRET    : Access Token Secret
-  DRY_RUN            : 値が入っていれば投稿せず生成結果を表示するだけ(テスト用)
+  ANTHROPIC_API_KEY, WP_BASE_URL, WP_USER, WP_APP_PASSWORD, WP_CATEGORY_ID(任意),
+  X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET,
+  DRY_RUN(値が入っていれば投稿せず生成結果を表示するだけ)
 """
 
 import os
@@ -35,20 +32,13 @@ import datetime as dt
 from zoneinfo import ZoneInfo
 
 import requests
-from bs4 import BeautifulSoup
 import anthropic
 import tweepy
 
 JST = ZoneInfo("Asia/Tokyo")
 
-# 東証グロース市場250指数 = kabutan コード 0012
-KABUTAN_URL = "https://kabutan.jp/stock/kabuka?code=0012"
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 growth250-bot"
-    )
-}
+# moo-growth250-tracker がロリポップに配信している構成銘柄データ
+JSON_URL = "https://moo-stock-blog.com/growth250-data.json"
 
 MODEL = "claude-haiku-4-5-20251001"           # 本文生成(軽量モデル)
 WEB_SEARCH_TOOL = "web_search_20260209"       # ※現行版。docsで最新を要確認
@@ -56,79 +46,39 @@ TWEET_LIMIT = 140                             # 全角換算のおおよその�
 
 
 # --------------------------------------------------------------------------
-# 1. 終値データの取得(スクレイピング)
+# 1. 自前JSONから主役銘柄・騰落数を取得
 # --------------------------------------------------------------------------
-def _to_float(s: str) -> float:
-    return float(s.replace(",", "").replace("＋", "+").replace("△", "-").strip())
-
-
-def _find_ohlc_tables(soup: BeautifulSoup):
-    """ヘッダに『始値』『終値』『前日比』を含むテーブルを順に返す。"""
-    tables = []
-    for table in soup.find_all("table"):
-        head = table.get_text()
-        if "始値" in head and "終値" in head and "前日比" in head:
-            tables.append(table)
-    return tables
-
-
-def _parse_row(cells):
-    """データ行(先頭セルが yy/mm/dd)だけを辞書化。それ以外は None。"""
-    texts = [c.get_text(strip=True) for c in cells]
-    if len(texts) < 7:
-        return None
-    if not re.match(r"\d{2}/\d{2}/\d{2}", texts[0]):
-        return None
+def fetch_market_data() -> dict | None:
+    """growth250-data.json を読み、主役銘柄とbreadthを返す。失敗時 None。"""
     try:
-        return {
-            "date_raw": texts[0],
-            "close": _to_float(texts[4]),
-            "change": _to_float(texts[5]),
-            "pct": _to_float(texts[6]),
-        }
-    except ValueError:
+        r = requests.get(JSON_URL, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        print(f"[warn] JSON取得失敗: {e}", file=sys.stderr)
         return None
 
+    rows = data.get("all", [])
+    up = sum(1 for x in rows if x.get("change_pct", 0) > 0)
+    down = sum(1 for x in rows if x.get("change_pct", 0) < 0)
+    flat = sum(1 for x in rows if x.get("change_pct", 0) == 0)
 
-def fetch_close():
-    """本日の四本値と前日の騰落方向を取得。失敗時 None。"""
-    resp = requests.get(KABUTAN_URL, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    ohlc_tables = _find_ohlc_tables(soup)
-    if not ohlc_tables:
-        print("[warn] OHLCテーブルが見つかりません。kabutanのHTML構造変更の可能性。",
-              file=sys.stderr)
-        return None
-
-    today_row = None
-    for tr in ohlc_tables[0].find_all("tr"):
-        parsed = _parse_row(tr.find_all(["td", "th"]))
-        if parsed:
-            today_row = parsed
-            break
-    if today_row is None:
-        print("[warn] 本日行の解析に失敗しました。", file=sys.stderr)
-        return None
-
-    prev_dir = None
-    if len(ohlc_tables) >= 2:
-        for tr in ohlc_tables[1].find_all("tr"):
-            parsed = _parse_row(tr.find_all(["td", "th"]))
-            if parsed:
-                prev_dir = "up" if parsed["change"] >= 0 else "down"
-                break
-
-    today_row["prev_dir"] = prev_dir
-    return today_row
+    return {
+        "updated_at": data.get("updated_at", ""),
+        "total": data.get("total_count", len(rows)),
+        "up": up,
+        "down": down,
+        "flat": flat,
+        "best": data.get("best", [])[:5],
+        "worst": data.get("worst", [])[:5],
+    }
 
 
-def is_today_jst(date_raw: str) -> bool:
-    today = dt.datetime.now(JST).date()
+def is_data_today(updated_at: str) -> bool:
+    """updated_at('2026-05-28 15:32 JST')の日付が本日(JST)かどうか。"""
     try:
-        yy, mm, dd = (int(x) for x in date_raw.split("/"))
-        return dt.date(2000 + yy, mm, dd) == today
+        day = updated_at.split()[0]  # 'YYYY-MM-DD'
+        return day == dt.datetime.now(JST).strftime("%Y-%m-%d")
     except Exception:
         return False
 
@@ -157,36 +107,40 @@ def _parse_json(text: str) -> dict:
     return json.loads(t)
 
 
-def generate_content(data) -> dict:
+def _fmt_movers(items) -> str:
+    return "、".join(
+        f"{x.get('name_jp', '')}({x.get('change_pct', 0):+.1f}%)" for x in items
+    ) or "(該当なし)"
+
+
+def generate_content(m: dict) -> dict:
     """{'title','body_html','tweet'} を返す。"""
     client = anthropic.Anthropic()  # ANTHROPIC_API_KEY を自動参照
     today_label = dt.datetime.now(JST).strftime("%-m/%-d")
-    prev_hint = {
-        "up": "前営業日は上昇(今日も上昇なら『続伸』、下落なら『反落』)。",
-        "down": "前営業日は下落(今日上昇なら『反発』、下落なら『続落』)。",
-        None: "前日方向は不明なので方向の語(反発等)は断定しすぎない。",
-    }[data.get("prev_dir")]
 
     prompt = f"""あなたは日本株の市況コメントを書く新聞記者です。
 
-本日({today_label})の東証グロース市場250指数(グロース250)の確定値は以下です。
-推測で変えず、この数値を**そのまま**使ってください:
-  終値: {data['close']:.2f}
-  前日比: {data['change']:+.2f}ポイント({data['pct']:+.2f}%)
-{prev_hint}
+本日({today_label})の東証グロース市場250指数(グロース250)の概況を書きます。
+以下は当日の構成銘柄データ(自前集計・正確)です。**個別銘柄や騰落数の言及にはこの値を使ってください**:
+  値上がり {m['up']}銘柄 / 値下がり {m['down']}銘柄 / 変わらず {m['flat']}銘柄(全{m['total']}銘柄)
+  上昇上位: {_fmt_movers(m['best'])}
+  下落上位: {_fmt_movers(m['worst'])}
 
-ウェブ検索で、本日のグロース市場の値動きの背景を調べてください:
-  - 物色の材料(全体地合い、日経平均の動き、テーマ等)
-  - 上昇/下落が目立った主な個別銘柄
+次に、**ウェブ検索で本日のグロース250の大引け情報を調べてください**:
+  - 日経「新興株◯日…」や株探・JPX等の信頼できる情報源から、
+    指数の終値(例 835.56)・前日比(◯.◯ポイント)・騰落率(◯.◯%)・
+    方向(反発/続伸/反落/続落)を取得する。
+  - 値動きの背景(全体地合い、日経平均、テーマ等の材料)も調べる。
+  - **数字は検索で確認できたものだけ**を書くこと。確認できなければ、指数の正確な数値は
+    書かず、上の騰落数・個別銘柄から方向感だけを述べる(数字を創作しない)。
 
-その上で、次の3つを**JSONだけ**で出力してください
-(コードフェンスや前置き・説明は一切不要。純粋なJSONのみ):
+その上で、次の3つを**JSONだけ**で出力(コードフェンス・前置き・説明は一切不要):
 {{
-  "title": "SEOを意識した記事見出し。日付・終値・方向(反発等)を含め、30〜45字程度。",
-  "body_html": "<p>段落</p> を2〜3個。最初の段落で指数の結果(終値と前日比)、次に背景、必要なら主な個別銘柄。事実ベースで簡潔に。HTMLタグは<p>と<strong>程度のみ。",
+  "title": "SEOを意識した記事見出し。日付・終値や方向を含め30〜45字程度。",
+  "body_html": "<p>段落</p> を2〜3個。最初の段落で指数の結果、次に背景、必要なら主な個別銘柄。事実ベースで簡潔に。タグは<p>と<strong>程度のみ。",
   "tweet": "ツイート本文。全角{TWEET_LIMIT}字以内。**リンクは入れない**。末尾に #グロース250 #新興市場 を付けてよい。"
 }}
-数値は上記の正確値を使い、JSON以外は出力しないこと。"""
+JSON以外は出力しないこと。"""
 
     resp = client.messages.create(
         model=MODEL,
@@ -248,20 +202,20 @@ def post_to_x(text: str):
 # main
 # --------------------------------------------------------------------------
 def main():
-    data = fetch_close()
-    if data is None:
-        print("[skip] 終値データを取得できませんでした。終了します。")
+    m = fetch_market_data()
+    if m is None:
+        print("[skip] 構成銘柄データを取得できませんでした。終了します。")
         return 0
 
-    if not is_today_jst(data["date_raw"]):
-        print(f"[skip] 最新データの日付({data['date_raw']})が本日ではありません。"
-              f"休場日とみなしスキップします。")
+    if not is_data_today(m["updated_at"]):
+        print(f"[skip] JSONの更新日({m['updated_at']})が本日ではありません。"
+              f"休場日 or 更新待ちとみなしスキップします。")
         return 0
 
-    print(f"[data] 終値={data['close']:.2f} 前日比={data['change']:+.2f}"
-          f"({data['pct']:+.2f}%) 前日方向={data.get('prev_dir')}")
+    print(f"[data] 値上がり{m['up']}/値下がり{m['down']}/変わらず{m['flat']}"
+          f"(全{m['total']}) updated_at={m['updated_at']}")
 
-    content = generate_content(data)
+    content = generate_content(m)
     title = content.get("title", "").strip()
     body = content.get("body_html", "").strip()
     tweet = content.get("tweet", "").strip()
@@ -277,8 +231,6 @@ def main():
         return 0
 
     ok = True
-
-    # ① ブログ(真の置き場)を先に
     try:
         link = post_to_wordpress(title, body)
         print(f"[wordpress] 公開しました: {link}")
@@ -286,7 +238,6 @@ def main():
         ok = False
         print(f"[error] WordPress投稿に失敗: {e}", file=sys.stderr)
 
-    # ② X(拡散役・リンクなし)
     try:
         resp = post_to_x(tweet)
         tid = resp.data.get("id") if resp and resp.data else "?"
