@@ -145,7 +145,12 @@ JSON以外は出力しないこと。"""
     resp = client.messages.create(
         model=MODEL,
         max_tokens=2000,
-        tools=[{"type": WEB_SEARCH_TOOL, "name": "web_search", "max_uses": 5}],
+        tools=[{
+            "type": WEB_SEARCH_TOOL,
+            "name": "web_search",
+            "max_uses": 5,
+            "allowed_callers": ["direct"],
+        }],
         messages=[{"role": "user", "content": prompt}],
     )
     obj = _parse_json(_extract_text(resp))
