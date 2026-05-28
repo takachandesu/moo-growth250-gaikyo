@@ -1,0 +1,49 @@
+name: グロース250 大引け概況をXに投稿
+
+on:
+  schedule:
+    # 06:50 UTC = 15:50 JST（平日）。
+    # ※ Actions の cron は混雑時に数分〜十数分遅れることがあります。
+    #   引け(15:30)+データ遅延を見て少し余裕をとっています。
+    - cron: "50 6 * * 1-5"
+  workflow_dispatch:        # 手動実行(テスト用)
+    inputs:
+      dry_run:
+        description: "投稿せず本文だけ確認する"
+        type: boolean
+        default: true
+
+# 直前の実行が終わる前に次が始まらないように
+concurrency:
+  group: growth250-post
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 依存パッケージをインストール
+        run: pip install -r requirements.txt
+
+      - name: 概況を生成して投稿
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
+          WP_USER: ${{ secrets.WP_USER }}
+          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+          WP_CATEGORY_ID: ${{ secrets.WP_CATEGORY_ID }}
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_SECRET: ${{ secrets.X_ACCESS_SECRET }}
+          # 手動実行で dry_run=true のときだけ DRY_RUN を立てる。
+          # スケジュール実行では常に本番投稿。
+          DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && '1' || '' }}
+        run: python post_growth250.py
