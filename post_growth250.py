@@ -29,8 +29,11 @@ import os
 import re
 import sys
 import json
+import time
 import datetime as dt
+from typing import Optional
 from zoneinfo import ZoneInfo
+from pathlib import Path
 
 import requests
 import anthropic
@@ -40,23 +43,47 @@ JST = ZoneInfo("Asia/Tokyo")
 
 # moo-growth250-tracker がロリポップに配信している構成銘柄データ
 JSON_URL = "https://moo-stock-blog.com/growth250-data.json"
+# トラッカーに統合した場合、同じワークフローで生成されるローカルファイル
+# (scripts/post_growth250.py から見た repo-root/public/growth250-data.json)
+LOCAL_JSON = Path(__file__).resolve().parent.parent / "public" / "growth250-data.json"
 
 MODEL = "claude-haiku-4-5-20251001"           # 本文生成(軽量モデル)
 TWEET_LIMIT = 140                             # 全角換算のおおよその上限(無印アカウント)
+# ツイート末尾の固定フッター(URLは載せない方針)
+TWEET_FOOTER = "詳細はプロフィールのリンクから確認してください"
+# フッター+空行ぶんを引いた、本文に使える全角字数の予算
+TWEET_BODY_LIMIT = TWEET_LIMIT - len(TWEET_FOOTER) - 2  # ≒114字
 
 
 # --------------------------------------------------------------------------
 # 1. 自前JSONから主役銘柄・騰落数を取得
 # --------------------------------------------------------------------------
 def fetch_market_data() -> dict | None:
-    """growth250-data.json を読み、主役銘柄とbreadthを返す。失敗時 None。"""
+    """growth250-data.json を読み、主役銘柄とbreadthを返す。失敗時 None。
+
+    1) 同じワークフローで生成されたローカルファイルを優先(接続不要)
+    2) 無ければロリポップ上のURLからHTTP取得
+    """
+    data = None
+
+    # 1) ローカルファイル(統合運用時)
     try:
-        r = requests.get(JSON_URL, timeout=20)
-        r.raise_for_status()
-        data = r.json()
+        if LOCAL_JSON.exists():
+            data = json.loads(LOCAL_JSON.read_text(encoding="utf-8"))
+            print(f"[info] ローカルJSONを読み込み: {LOCAL_JSON}")
     except Exception as e:
-        print(f"[warn] JSON取得失敗: {e}", file=sys.stderr)
-        return None
+        print(f"[warn] ローカルJSON読み込み失敗: {e}", file=sys.stderr)
+
+    # 2) HTTPフォールバック
+    if data is None:
+        try:
+            r = requests.get(JSON_URL, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            print("[info] HTTPでJSON取得")
+        except Exception as e:
+            print(f"[warn] JSON取得失敗: {e}", file=sys.stderr)
+            return None
 
     rows = data.get("all", [])
     up = sum(1 for x in rows if x.get("change_pct", 0) > 0)
@@ -84,8 +111,11 @@ def is_data_today(updated_at: str) -> bool:
 
 
 def weighted_len(text: str) -> int:
-    """Xの重み付き文字数(ざっくり): ASCIIは1、それ以外(全角等)は2。"""
-    return sum(1 if ord(ch) < 0x1100 else 2 for ch in text)
+    """Xの重み付き文字数(ざっくり): ASCIIは1、それ以外(全角等)は2。
+    URLはX側でt.coに短縮され23固定になるので、計測でも23扱いにする。"""
+    # URLを23文字分のプレースホルダに置換してから数える
+    text_for_count = re.sub(r"https?://\S+", "X" * 23, text)
+    return sum(1 if ord(ch) < 0x1100 else 2 for ch in text_for_count)
 
 
 # --------------------------------------------------------------------------
@@ -145,7 +175,7 @@ def generate_content(m: dict) -> dict:
 {{
   "title": "記事見出し。日付と、騰落数の傾向や主役銘柄を含め30〜45字程度。指数の数値や上昇/下落の断定は入れない。",
   "body_html": "<p>段落</p> を2個程度。1段落目で構成銘柄の騰落傾向、2段落目で主な上昇・下落銘柄(と読み取れるテーマ)。事実ベースで簡潔に。タグは<p>と<strong>程度のみ。",
-  "tweet": "ツイート本文。全角{TWEET_LIMIT}字以内。**リンクは入れない**。末尾に #グロース250 #新興市場 を付けてよい。指数の数値・方向断定は入れない。"
+  "tweet": "ツイート本文。全角{TWEET_BODY_LIMIT}字以内、ただし**{TWEET_BODY_LIMIT - 15}字以上を目安にしっかり書く**(短すぎ注意)。騰落数に加えて、上昇側・下落側それぞれ2〜3銘柄の名前と騰落率、読み取れるテーマまで盛り込む。**リンクは入れない**。末尾に #グロース250 #新興市場 を付けてよい。指数の数値・方向断定は入れない。"
 }}
 JSON以外は出力しないこと。"""
 
@@ -157,13 +187,13 @@ JSON以外は出力しないこと。"""
     obj = _parse_json(_extract_text(resp))
 
     # ツイートが長すぎる場合は1回だけ短縮
-    if weighted_len(obj.get("tweet", "")) > TWEET_LIMIT * 2:
+    if weighted_len(obj.get("tweet", "")) > TWEET_BODY_LIMIT * 2:
         resp2 = client.messages.create(
             model=MODEL,
             max_tokens=600,
             messages=[{
                 "role": "user",
-                "content": f"次のツイートを、意味を保ったまま全角{TWEET_LIMIT}字以内に。"
+                "content": f"次のツイートを、意味を保ったまま全角{TWEET_BODY_LIMIT}字以内に。"
                            f"リンクは入れない。本文のみ出力:\n\n{obj['tweet']}",
             }],
         )
@@ -172,7 +202,7 @@ JSON以外は出力しないこと。"""
 
 
 # --------------------------------------------------------------------------
-# 3a. WordPress に本物の記事として投稿
+# 3a. WordPress に本物の記事として投稿（タイムアウト時はリトライ）
 # --------------------------------------------------------------------------
 def post_to_wordpress(title: str, body_html: str) -> str:
     base = os.environ["WP_BASE_URL"].rstrip("/")
@@ -181,14 +211,30 @@ def post_to_wordpress(title: str, body_html: str) -> str:
     cat = os.environ.get("WP_CATEGORY_ID")
     if cat:
         payload["categories"] = [int(cat)]
-    r = requests.post(
-        url,
-        json=payload,
-        auth=(os.environ["WP_USER"], os.environ["WP_APP_PASSWORD"]),
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json().get("link", "(URL不明)")
+
+    # ロリポップは時々重い。タイムアウトしたら最大3回までリトライ。
+    last_err: Optional[Exception] = None
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(
+                url,
+                json=payload,
+                auth=(os.environ["WP_USER"], os.environ["WP_APP_PASSWORD"]),
+                timeout=(30, 60),  # (connect, read)
+            )
+            r.raise_for_status()
+            return r.json().get("link", "(URL不明)")
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_err = e
+            wait = 15 * attempt  # 15秒 → 30秒 → 45秒
+            print(f"[warn] WP投稿 試行{attempt}/3 失敗({type(e).__name__})。{wait}秒待って再試行", file=sys.stderr)
+            if attempt < 3:
+                time.sleep(wait)
+        except Exception as e:
+            # タイムアウト系以外(認証エラー等)はリトライしても無意味なので即諦める
+            raise
+    # 3回とも失敗
+    raise last_err  # type: ignore
 
 
 # --------------------------------------------------------------------------
@@ -238,14 +284,23 @@ def main():
 
     ok = True
     try:
-        link = post_to_wordpress(title, body)
-        print(f"[wordpress] 公開しました: {link}")
+        wp_link = post_to_wordpress(title, body)
+        print(f"[wordpress] 公開しました: {wp_link}")
     except Exception as e:
         ok = False
         print(f"[error] WordPress投稿に失敗: {e}", file=sys.stderr)
 
+    # ツイート末尾に固定フッターを付ける(URLは載せない方針)
+    final_tweet = tweet
+    candidate = f"{tweet}\n\n{TWEET_FOOTER}"
+    if weighted_len(candidate) <= TWEET_LIMIT * 2:
+        final_tweet = candidate
+    else:
+        print(f"[warn] フッター付与で重み{weighted_len(candidate)}>{TWEET_LIMIT*2}のためフッターなしで投稿", file=sys.stderr)
+    print(f"[info] 最終ツイート(重み付き{weighted_len(final_tweet)}/{TWEET_LIMIT*2})")
+
     try:
-        resp = post_to_x(tweet)
+        resp = post_to_x(final_tweet)
         tid = resp.data.get("id") if resp and resp.data else "?"
         print(f"[x] 投稿しました: tweet id = {tid}")
     except Exception as e:
